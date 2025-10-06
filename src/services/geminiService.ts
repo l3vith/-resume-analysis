@@ -1,25 +1,22 @@
-import { GoogleGenerativeAI } from '@google/generative-ai';
-// @ts-expect-error: No types for pdfjs-dist
-import * as pdfjsLib from 'pdfjs-dist';
-import 'pdfjs-dist/build/pdf.worker.entry.js';
+import { GoogleGenerativeAI } from "@google/generative-ai";
+import * as pdfjsLib from "pdfjs-dist";
+import "pdfjs-dist/build/pdf.worker.entry.js";
 
 const genAI = new GoogleGenerativeAI(import.meta.env.VITE_GEMINI_API_KEY);
 
 export interface AnalysisResult {
-  score: number;
-  breakdown: {
-    keywords: number;
+  scores: {
+    overall: number;
+    atsCompatibility: number;
+    keywordOptimization: number;
     formatting: number;
-    experience: number;
-    skills: number;
-    education: number;
+    impact: number;
   };
-  improvements: {
-    critical: string[];
-    important: string[];
-    suggested: string[];
-  };
+  summary: string;
   strengths: string[];
+  improvements: string[];
+  criticalIssues: string[];
+  suggestions: string[];
 }
 
 const ATS_ANALYSIS_PROMPT = `
@@ -44,119 +41,225 @@ Respond with a JSON object in this exact format:
     "important": ["Add professional summary", "Use consistent formatting"],
     "suggested": ["Include relevant certifications", "Add volunteer experience"]
   },
-  "strengths": ["Clear work history", "Good educational background", "Professional formatting"]
+  "strengths": ["Clear work history", "Good educational background", "Professional formatting"],
+  "summary": "Short summary sentence describing overall impression."
 }
 \`\`\`
-
-Analysis Guidelines:
-- Score based on ATS compatibility, keyword optimization, formatting, and content quality
-- Critical issues: Problems that would cause ATS rejection or major parsing errors
-- Important improvements: Issues that significantly impact ranking and visibility
-- Suggested enhancements: Nice-to-have improvements for better presentation
-- Strengths: Positive aspects that work well for ATS systems
-
-Consider these ATS factors:
-1. Keyword relevance and density
-2. Standard section headers (Experience, Education, Skills, etc.)
-3. Consistent formatting and structure
-4. Contact information placement
-5. File format compatibility
-6. Use of standard fonts and formatting
-7. Quantified achievements
-8. Industry-specific terminology
-9. Skills section optimization
-10. Education credentials formatting
 
 Resume text to analyze:
 `;
 
-export async function analyzeResumeWithGemini(resumeText: string): Promise<AnalysisResult> {
+export async function analyzeResumeWithGemini(
+  resumeText: string,
+): Promise<AnalysisResult> {
   try {
     const model = genAI.getGenerativeModel({ model: "gemini-flash-latest" });
-    
     const prompt = ATS_ANALYSIS_PROMPT + resumeText;
-    
+
     const result = await model.generateContent(prompt);
     const response = await result.response;
     const text = response.text();
-    
-    // Extract JSON from the response - look for JSON code blocks first, then fallback to raw JSON
-    let jsonMatch = text.match(/```json\s*([\s\S]*?)\s*```/);
+
+    let jsonMatch = text.match(/```json\s*([\s\S]*?)\s*```/i);
     if (!jsonMatch) {
       jsonMatch = text.match(/\{[\s\S]*\}/);
     }
-    
+
     if (!jsonMatch) {
-      console.error('Gemini response:', text);
-      throw new Error('No valid JSON found in response. Please try again.');
+      console.error(
+        "Gemini response did not contain JSON. Full response:",
+        text,
+      );
+      throw new Error(
+        "No valid JSON found in response from Gemini. Try again.",
+      );
     }
-    
+
     const jsonText = jsonMatch[1] || jsonMatch[0];
-    const analysisResult = JSON.parse(jsonText);
-    
-    // Validate the response structure
-    if (!analysisResult.score || !analysisResult.breakdown || !analysisResult.improvements || !analysisResult.strengths) {
-      console.error('Invalid structure:', analysisResult);
-      throw new Error('Invalid response structure from Gemini API');
+    let raw: any;
+    try {
+      raw = JSON.parse(jsonText);
+    } catch (parseErr) {
+      console.error(
+        "Failed to JSON.parse extracted text. Extracted text:",
+        jsonText,
+      );
+      throw new Error("Failed to parse JSON from Gemini response");
     }
-    
-    return analysisResult;
+
+    const overall =
+      typeof raw.score === "number"
+        ? raw.score
+        : typeof raw.score === "string"
+          ? Number(raw.score) || 0
+          : 0;
+    const breakdown = raw.breakdown || {};
+    const keywords =
+      Number(breakdown.keywords ?? breakdown.keywordsScore ?? 0) || 0;
+    const formatting = Number(breakdown.formatting ?? 0) || 0;
+    const experience = Number(breakdown.experience ?? 0) || 0;
+    const skills = Number(breakdown.skills ?? 0) || 0;
+    const education = Number(breakdown.education ?? 0) || 0;
+
+    const improvementsFlat: string[] = [];
+    if (Array.isArray(raw.improvements)) {
+      improvementsFlat.push(
+        ...raw.improvements.filter((i: any) => typeof i === "string"),
+      );
+    } else if (raw.improvements && typeof raw.improvements === "object") {
+      const keys = ["critical", "important", "suggested", "recommended"];
+      for (const k of keys) {
+        if (Array.isArray(raw.improvements[k])) {
+          improvementsFlat.push(
+            ...raw.improvements[k].filter((i: any) => typeof i === "string"),
+          );
+        }
+      }
+    }
+
+    const strengths: string[] = Array.isArray(raw.strengths)
+      ? raw.strengths.filter((s: any) => typeof s === "string")
+      : [];
+
+    const mapped: AnalysisResult = {
+      scores: {
+        overall: Math.round(overall),
+        atsCompatibility:
+          Math.round(
+            (experience + education) / (experience || education ? 2 : 1),
+          ) || 0,
+        keywordOptimization: Math.round(keywords) || 0,
+        formatting: Math.round(formatting) || 0,
+        impact:
+          Math.round((skills + experience) / (skills || experience ? 2 : 1)) ||
+          0,
+      },
+      summary:
+        (raw.summary && String(raw.summary)) ||
+        (raw.analysisSummary && String(raw.analysisSummary)) ||
+        "",
+      strengths,
+      improvements: improvementsFlat,
+      criticalIssues: Array.isArray(raw.improvements?.critical)
+        ? raw.improvements.critical.filter((i: any) => typeof i === "string")
+        : [],
+      suggestions: Array.isArray(raw.improvements?.suggested)
+        ? raw.improvements.suggested.filter((i: any) => typeof i === "string")
+        : [],
+    };
+
+    for (const key of Object.keys(mapped.scores) as Array<
+      keyof AnalysisResult["scores"]
+    >) {
+      let v = mapped.scores[key];
+      if (Number.isNaN(v) || v === Infinity || v === -Infinity) v = 0;
+      mapped.scores[key] = Math.max(0, Math.min(100, Math.round(v)));
+    }
+
+    return mapped;
   } catch (error) {
-    console.error('Error analyzing resume with Gemini:', error);
-    
-    // Handle specific error types
+    console.error("Error analyzing resume with Gemini:", error);
     if (error instanceof Error) {
-      if (error.message.includes('503') || error.message.includes('unavailable')) {
-        throw new Error('Gemini API is temporarily unavailable. Please try again in a few moments.');
+      if (
+        error.message.includes("Unavailable") ||
+        error.message.includes("503")
+      ) {
+        throw new Error(
+          "Gemini API is temporarily unavailable. Please try again later.",
+        );
       }
-      if (error.message.includes('JSON') || error.message.includes('structure')) {
-        throw new Error('Failed to parse analysis results. Please try again.');
+      if (error.message.includes("JSON") || error.message.includes("parse")) {
+        throw new Error(
+          "Failed to parse analysis results from Gemini. Try again.",
+        );
       }
-      if (error.message.includes('API key')) {
-        throw new Error('Invalid API key. Please check your Gemini API key configuration.');
+      if (error.message.includes("API key")) {
+        throw new Error("Invalid Gemini API key. Check configuration.");
       }
     }
-    
-    throw new Error('Failed to analyze resume. Please try again.');
+    throw new Error("Failed to analyze resume. Please try again.");
   }
 }
 
 export async function extractTextFromFile(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
-    if (file.type === 'text/plain') {
+    if (file.type === "text/plain") {
       const reader = new FileReader();
       reader.onload = (e) => resolve(e.target?.result as string);
-      reader.onerror = () => reject(new Error('Failed to read text file'));
+      reader.onerror = () => reject(new Error("Failed to read text file"));
       reader.readAsText(file);
-    } else if (file.type === 'application/pdf') {
+    } else if (file.type === "application/pdf") {
       const reader = new FileReader();
       reader.onload = async (e) => {
         try {
-          // Use pdfjs-dist for robust PDF extraction
           const typedArray = new Uint8Array(e.target?.result as ArrayBuffer);
           const pdf = await pdfjsLib.getDocument({ data: typedArray }).promise;
-          let text = '';
+          let text = "";
           for (let i = 1; i <= pdf.numPages; i++) {
             const page = await pdf.getPage(i);
             const content = await page.getTextContent();
-            text += content.items.map((item: any) => item.str).join(' ') + '\n';
+            text += content.items.map((item: any) => item.str).join(" ") + "\n";
           }
           if (text.trim().length > 50) {
             resolve(text.trim());
           } else {
-            reject(new Error('Could not extract readable text from PDF. Please try converting your PDF to a text file or copy-paste the content.'));
+            reject(
+              new Error(
+                "Could not extract readable text from PDF. Please try converting your PDF to a text file or copy-paste the content.",
+              ),
+            );
           }
-        } catch (error) {
-          console.error('PDF parsing error:', error);
-          reject(new Error('Failed to parse PDF. Please try a different PDF or convert to text format.'));
+        } catch (err) {
+          console.error("PDF parsing error:", err);
+          reject(
+            new Error(
+              "Failed to parse PDF. Try a different PDF or convert to text.",
+            ),
+          );
         }
       };
-      reader.onerror = () => reject(new Error('Failed to read PDF file'));
+      reader.onerror = () => reject(new Error("Failed to read PDF file"));
       reader.readAsArrayBuffer(file);
-    } else if (file.type === 'application/msword' || file.type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
-      reject(new Error('Word documents are not supported yet. Please convert your resume to PDF or text format.'));
+    } else if (
+      file.type === "application/msword" ||
+      file.type ===
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    ) {
+      reject(
+        new Error(
+          "Word documents are not supported yet. Please convert your resume to PDF or text format.",
+        ),
+      );
     } else {
-      reject(new Error('Unsupported file type. Please use PDF or text files.'));
+      const reader = new FileReader();
+      reader.onload = async (e) => {
+        try {
+          const arr = e.target?.result as ArrayBuffer;
+          const typedArray = new Uint8Array(arr);
+          const pdf = await pdfjsLib.getDocument({ data: typedArray }).promise;
+          let text = "";
+          for (let i = 1; i <= pdf.numPages; i++) {
+            const page = await pdf.getPage(i);
+            const content = await page.getTextContent();
+            text += content.items.map((item: any) => item.str).join(" ") + "\n";
+          }
+          if (text.trim().length > 50) {
+            resolve(text.trim());
+          } else {
+            reject(
+              new Error(
+                "Could not extract readable text from file. Please provide a PDF or text file.",
+              ),
+            );
+          }
+        } catch (err) {
+          reject(
+            new Error("Unsupported file type. Please use PDF or text files."),
+          );
+        }
+      };
+      reader.onerror = () => reject(new Error("Failed to read file"));
+      reader.readAsArrayBuffer(file);
     }
   });
 }
